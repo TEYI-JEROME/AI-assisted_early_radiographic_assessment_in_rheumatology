@@ -1,0 +1,3513 @@
+## Local-first MVP architecture summary (Windows + VS Code, CPU-only)
+
+RheumaAssist V1 is a **local-first clinical prototype** designed to run on a **CPU-only Windows laptop** with minimal infrastructure. It is intentionally scoped to match the **validated research reality**: a **PyTorch ResNet‑18 binary erosion detector** operating on **wrist ROI images (224×224)**, producing an **erosion probability and binary prediction** that must be **reviewed and signed by a clinician**. The application **never claims to diagnose rheumatoid arthritis** and always separates: **AI result → clinician review → clinician interpretation**.
+
+**Frontend (Next.js 14 + TS + Tailwind)**  
+Runs locally via `npm run dev`. Provides:
+- ROI-direct upload (validated workflow)
+- Full radiograph upload + **manual ROI crop** (practical workflow) with explicit warnings about ROI quality
+- Patient registry, patient profile, longitudinal timeline, comparison view, assistant panel, admin screens
+
+**Backend (FastAPI + SQLAlchemy + Alembic + SQLite)**  
+Runs locally via `python -m uvicorn ...` and stores state in a local **SQLite** DB file.  
+- Uses **cookie-based JWT session** with recommended cookie attributes and a minimal CSRF defense for state-changing requests. citeturn1search4  
+- Uses **Argon2 password hashing**, aligned with OWASP guidance for password storage. citeturn0search2  
+- Validates uploads using an allowlist + image verification and safe storage, aligned with OWASP upload guidance. citeturn0search3turn0search7  
+
+**AI inference (PyTorch CPU-only)**  
+- Loads the real artifacts from `model_artifacts/`  
+- Loads weights using the `state_dict` pattern recommended by PyTorch documentation. citeturn0search1turn0search5  
+- Optionally loads TorchScript if present  
+- Performs required preprocessing: grayscale → 3-channel → resize 224×224 → normalize → sigmoid → threshold
+
+**Background processing**  
+V1 runs inference inline (simple) and remains structured so you can later add background tasks if needed; FastAPI supports background task patterns when you decide to offload processing. citeturn0search0
+
+---
+
+## Complete repository tree (local-first)
+
+```text
+rheumaassist/
+  README.md
+  .gitignore
+  model_artifacts/
+    .gitkeep
+  uploads/
+    .gitkeep
+  scripts/
+    seed_backend.py
+  backend/
+    .env.example
+    requirements.txt
+    alembic.ini
+    alembic/
+      env.py
+      script.py.mako
+      versions/
+        0001_initial.py
+    app/
+      __init__.py
+      main.py
+      core/
+        __init__.py
+        config.py
+        errors.py
+        security.py
+        csrf.py
+        rate_limit.py
+        audit.py
+      db/
+        __init__.py
+        base.py
+        session.py
+        deps.py
+      models/
+        __init__.py
+        user.py
+        role.py
+        patient.py
+        exam.py
+        uploaded_image.py
+        roi_selection.py
+        ai_analysis.py
+        clinician_review.py
+        assistant.py
+        audit_log.py
+      schemas/
+        __init__.py
+        auth.py
+        patient.py
+        exam.py
+        analysis.py
+        review.py
+        assistant.py
+        admin.py
+        audit.py
+      services/
+        __init__.py
+        password_service.py
+        token_service.py
+        auth_service.py
+        storage_service.py
+        patient_service.py
+        analysis_service.py
+        review_service.py
+        assistant_service.py
+        admin_service.py
+      ai/
+        __init__.py
+        model_arch.py
+        model_loader.py
+        preprocess.py
+        inference.py
+      api/
+        __init__.py
+        router.py
+        routes/
+          __init__.py
+          health.py
+          auth.py
+          patients.py
+          analyses.py
+          reviews.py
+          images.py
+          assistant.py
+          admin.py
+          audit.py
+    scripts/
+      __init__.py
+      seed.py
+    tests/
+      __init__.py
+      conftest.py
+      test_auth.py
+      test_patient_crud.py
+      test_analysis_service.py
+      test_model_loading.py
+  frontend/
+    .env.example
+    package.json
+    next.config.mjs
+    tsconfig.json
+    postcss.config.js
+    tailwind.config.ts
+    vitest.config.ts
+    public/
+      logo.svg
+    app/
+      globals.css
+      layout.tsx
+      page.tsx
+      auth/
+        login/page.tsx
+      app/
+        layout.tsx
+        dashboard/page.tsx
+        patients/
+          page.tsx
+          new/page.tsx
+          [patientId]/
+            page.tsx
+        analyses/
+          new/page.tsx
+          [analysisId]/
+            page.tsx
+            compare/page.tsx
+        admin/
+          page.tsx
+          users/page.tsx
+          audit/page.tsx
+          model/page.tsx
+    components/
+      ui/
+        button.tsx
+        card.tsx
+        input.tsx
+        textarea.tsx
+        select.tsx
+        badge.tsx
+        table.tsx
+        alert.tsx
+        spinner.tsx
+        tabs.tsx
+      layout/
+        app_shell.tsx
+        sidebar.tsx
+        topbar.tsx
+      auth/
+        auth_provider.tsx
+        require_auth.tsx
+      patients/
+        patient_table.tsx
+        patient_header.tsx
+      analyses/
+        image_uploader.tsx
+        roi_cropper.tsx
+        analysis_result_card.tsx
+        clinician_review_form.tsx
+        timeline_chart.tsx
+      assistant/
+        assistant_panel.tsx
+    hooks/
+      use_me.ts
+    lib/
+      api.ts
+      auth.ts
+      format.ts
+      validators.ts
+    types/
+      api.ts
+    tests/
+      setup.ts
+      smoke.test.tsx
+```
+
+---
+
+# Files
+
+FILE: rheumaassist/README.md
+```md
+# RheumaAssist (Local-first MVP)
+
+RheumaAssist is a local-first, English-language web application designed for internal hospital use to support **AI-assisted early radiographic assessment** in rheumatology workflows.
+
+## Clinical safety and scope (important)
+
+This application is **not** an autonomous diagnosis tool.
+
+- The AI component in version 1 is a **CPU-only PyTorch model** that predicts **binary erosion presence** from **wrist ROI images** (224×224).
+- The model was trained on **joint/bone-level ROI images**, not on full raw radiographs.
+- The system provides an **assistive probability score and prediction** that must be reviewed by a licensed clinician.
+- The application explicitly separates:
+  - AI result
+  - clinician review
+  - final clinician interpretation
+
+Required disclaimers are visible throughout the UI:
+- “AI output is assistive and must be reviewed by a licensed clinician.”
+- “This system supports early radiographic assessment and does not independently diagnose rheumatoid arthritis.”
+- “Prediction quality depends on image quality and ROI selection.”
+- “Final interpretation remains the responsibility of the clinician.”
+
+## Local-first goals
+
+This repository is intentionally optimized for:
+- Windows laptop development
+- VS Code
+- CPU-only inference
+- SQLite database
+- No Docker required
+- No Redis required
+- No PostgreSQL required
+
+You can run locally with:
+- Backend: `python -m uvicorn app.main:app --reload`
+- Frontend: `npm run dev`
+
+---
+
+## Prerequisites (Windows)
+
+Install:
+- Python **3.11.x**
+- Node.js **20+**
+- Git (optional but recommended)
+- VS Code
+
+---
+
+## Repository layout
+
+- `backend/` FastAPI API + SQLite + model inference
+- `frontend/` Next.js UI
+- `model_artifacts/` place your model files (not committed)
+- `uploads/` local private storage for images (not public)
+- `scripts/` helper scripts for seeding demo data
+
+---
+
+## Step 1 — Place model artifacts
+
+Copy your real model files into:
+
+`rheumaassist/model_artifacts/`
+
+Expected files:
+- `ero_resnet18_checkpoint.pth`
+- `ero_resnet18_config.json`
+- (optional) `ero_resnet18_scripted.pt`
+
+If the model artifacts are missing, the backend will return a clear error and will not generate fake predictions.
+
+---
+
+## Step 2 — Backend setup (Windows, VS Code)
+
+Open a terminal in VS Code.
+
+### 2.1 Create a virtual environment
+
+From repo root:
+
+**PowerShell**
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+**CMD**
+```bat
+cd backend
+python -m venv .venv
+.\.venv\Scripts\activate.bat
+```
+
+### 2.2 Install backend dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### 2.3 Configure backend environment
+
+Copy `.env.example` to `.env` inside `backend/`.
+
+**PowerShell**
+```powershell
+Copy-Item .env.example .env
+```
+
+**CMD**
+```bat
+copy .env.example .env
+```
+
+### 2.4 Initialize SQLite database with Alembic
+
+Still inside `backend/`:
+
+```powershell
+alembic upgrade head
+```
+
+This creates/updates:
+- `backend/data/rheumaassist.db`
+
+### 2.5 Seed demo users and demo patients
+
+```powershell
+python -m scripts.seed
+```
+
+Demo accounts created:
+
+- Admin:
+  - Email: `admin@local.demo`
+  - Password: `AdminPassword!ChangeMe`
+
+- Rheumatologist:
+  - Email: `rheum@local.demo`
+  - Password: `RheumPassword!ChangeMe`
+
+- Resident:
+  - Email: `resident@local.demo`
+  - Password: `ResidentPassword!ChangeMe`
+
+### 2.6 Run the backend
+
+```powershell
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Backend base URL:
+- http://127.0.0.1:8000
+
+API base prefix:
+- http://127.0.0.1:8000/api
+
+---
+
+## Step 3 — Frontend setup (Windows)
+
+Open a second terminal.
+
+From repo root:
+
+```powershell
+cd frontend
+npm install
+```
+
+Create the frontend env file:
+
+**PowerShell**
+```powershell
+Copy-Item .env.example .env.local
+```
+
+**CMD**
+```bat
+copy .env.example .env.local
+```
+
+Run the frontend:
+
+```powershell
+npm run dev
+```
+
+Frontend URL:
+- http://localhost:3000
+
+---
+
+## Using the application (V1 workflows)
+
+### Workflow A (validated)
+- Upload a pre-extracted wrist ROI image (PNG/JPG/JPEG)
+- Run erosion inference
+
+### Workflow B (practical)
+- Upload a full wrist radiograph
+- Manually crop/select ROI in the UI
+- Submit cropped ROI for inference
+
+A warning is displayed:
+“Prediction quality depends on image quality and ROI selection.”
+
+---
+
+## Troubleshooting (Windows)
+
+### PowerShell execution policy error when activating venv
+If you get an activation policy error, run:
+
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
+
+Then try:
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+### Torch installation issues on Windows
+If `pip install torch` fails, install from the official PyTorch selector instructions for your Python version and CPU build, then re-run:
+```powershell
+pip install -r requirements.txt
+```
+
+### Cookies not set / login not working
+- Ensure backend runs on `127.0.0.1:8000`
+- Ensure frontend `.env.local` uses `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000/api`
+- Ensure your browser allows cookies for localhost
+
+---
+
+## Security notes (local MVP)
+
+- Passwords are hashed (Argon2).
+- Auth uses HttpOnly cookies.
+- Uploads are validated, size-limited, and stored privately.
+- RBAC is enforced on sensitive endpoints.
+- Audit logs are recorded in SQLite.
+
+---
+
+## License / internal use
+
+This is a hospital-oriented prototype for internal use. Do not deploy externally without appropriate governance, security review, and compliance controls.
+```
+
+FILE: rheumaassist/.gitignore
+```gitignore
+# OS
+.DS_Store
+Thumbs.db
+
+# Env files
+.env
+.env.local
+.env.*.local
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.log
+backend/.venv/
+backend/venv/
+backend/data/
+backend/.coverage
+backend/htmlcov/
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+
+# Uploads and artifacts (never commit patient images)
+uploads/**
+
+# Model artifacts (never commit model binaries)
+model_artifacts/*.pth
+model_artifacts/*.pt
+model_artifacts/*.onnx
+
+# Keep placeholders
+!uploads/.gitkeep
+!model_artifacts/.gitkeep
+```
+
+FILE: rheumaassist/model_artifacts/.gitkeep
+```txt
+Place private model artifacts here:
+
+- ero_resnet18_checkpoint.pth
+- ero_resnet18_config.json
+- (optional) ero_resnet18_scripted.pt
+```
+
+FILE: rheumaassist/uploads/.gitkeep
+```txt
+Local private uploads directory.
+
+Uploaded images are stored here during local development.
+Do not commit any uploaded files.
+```
+
+FILE: rheumaassist/scripts/seed_backend.py
+```python
+"""
+Run this from repo root after backend dependencies are installed:
+
+PowerShell:
+  python scripts/seed_backend.py
+
+This script calls the backend seeding module in a Windows-friendly way.
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND_DIR = ROOT / "backend"
+
+sys.path.insert(0, str(BACKEND_DIR))  # so "app" is importable
+os.chdir(str(BACKEND_DIR))
+
+from scripts.seed import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    main()
+```
+
+FILE: rheumaassist/backend/.env.example
+```env
+# -----------------------------
+# Local-first Backend Settings
+# -----------------------------
+ENV=development
+
+# SQLite database (relative to backend/ folder):
+DATABASE_URL=sqlite:///./data/rheumaassist.db
+
+# Security
+SECRET_KEY=change_me_use_long_random_value
+JWT_ISSUER=rheumaassist-local
+ACCESS_TOKEN_TTL_MINUTES=480
+
+# Cookies
+COOKIE_NAME=ra_access
+COOKIE_SECURE=false
+COOKIE_SAMESITE=lax
+
+# CSRF (double submit)
+CSRF_COOKIE_NAME=ra_csrf
+CSRF_HEADER_NAME=X-CSRF-Token
+
+# CORS
+FRONTEND_ORIGIN=http://localhost:3000
+
+# Upload constraints
+MAX_UPLOAD_MB=10
+ALLOWED_IMAGE_TYPES=image/png,image/jpeg
+
+# Paths (relative paths are resolved from backend/)
+MODEL_ARTIFACTS_DIR=../model_artifacts
+UPLOADS_DIR=../uploads
+
+# Model filenames
+MODEL_CHECKPOINT_FILENAME=ero_resnet18_checkpoint.pth
+MODEL_CONFIG_FILENAME=ero_resnet18_config.json
+MODEL_SCRIPTED_FILENAME=ero_resnet18_scripted.pt
+USE_TORCHSCRIPT=false
+```
+
+FILE: rheumaassist/backend/requirements.txt
+```txt
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+SQLAlchemy==2.0.32
+alembic==1.13.2
+
+pydantic==2.8.2
+pydantic-settings==2.4.0
+
+PyJWT==2.9.0
+passlib[argon2]==1.7.4
+argon2-cffi==23.1.0
+
+Pillow==10.4.0
+numpy==2.0.1
+
+# CPU inference
+torch==2.3.1
+torchvision==0.18.1
+
+pytest==8.3.2
+httpx==0.27.2
+```
+
+FILE: rheumaassist/backend/alembic.ini
+```ini
+[alembic]
+script_location = alembic
+prepend_sys_path = .
+sqlalchemy.url = sqlite:///./data/rheumaassist.db
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = INFO
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers = console
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers = console
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stdout,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+```
+
+FILE: rheumaassist/backend/alembic/env.py
+```python
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+from app.core.config import settings
+from app.db.base import Base
+from app.models import (  # noqa: F401
+    user,
+    role,
+    patient,
+    exam,
+    uploaded_image,
+    roi_selection,
+    ai_analysis,
+    clinician_review,
+    assistant,
+    audit_log,
+)
+
+config = context.config
+fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def get_url() -> str:
+    return settings.database_url
+
+
+def run_migrations_offline() -> None:
+    context.configure(
+        url=get_url(),
+        target_metadata=target_metadata,
+        literal_binds=True,
+        compare_type=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    configuration = config.get_section(config.config_ini_section) or {}
+    configuration["sqlalchemy.url"] = get_url()
+
+    connectable = engine_from_config(
+        configuration,
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+FILE: rheumaassist/backend/alembic/script.py.mako
+```mako
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = ${repr(up_revision)}
+down_revision = ${repr(down_revision)}
+branch_labels = ${repr(branch_labels)}
+depends_on = ${repr(depends_on)}
+
+def upgrade():
+    ${upgrades if upgrades else "pass"}
+
+def downgrade():
+    ${downgrades if downgrades else "pass"}
+```
+
+FILE: rheumaassist/backend/alembic/versions/0001_initial.py
+```python
+"""initial schema (local-first SQLite)
+
+Revision ID: 0001_initial
+Revises: None
+Create Date: 2026-03-17
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "0001_initial"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "roles",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("name", sa.String(50), nullable=False, unique=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+
+    op.create_table(
+        "users",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("email", sa.String(255), nullable=False, unique=True),
+        sa.Column("full_name", sa.String(200), nullable=False),
+        sa.Column("password_hash", sa.String(500), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("1")),
+        sa.Column("failed_login_attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("locked_until", sa.DateTime(), nullable=True),
+        sa.Column("last_login_at", sa.DateTime(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+    )
+
+    op.create_table(
+        "user_roles",
+        sa.Column("user_id", sa.String(36), sa.ForeignKey("users.id"), primary_key=True),
+        sa.Column("role_id", sa.String(36), sa.ForeignKey("roles.id"), primary_key=True),
+    )
+
+    op.create_table(
+        "patients",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("patient_id", sa.String(50), nullable=False, unique=True),
+        sa.Column("hospital_number", sa.String(50), nullable=False),
+        sa.Column("full_name", sa.String(200), nullable=False),
+        sa.Column("date_of_birth", sa.Date(), nullable=False),
+        sa.Column("sex", sa.String(20), nullable=False),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_patients_patient_id", "patients", ["patient_id"])
+    op.create_index("ix_patients_full_name", "patients", ["full_name"])
+
+    op.create_table(
+        "exams",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("exam_date", sa.Date(), nullable=False),
+        sa.Column("created_by_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_exams_patient_id", "exams", ["patient_id"])
+    op.create_index("ix_exams_exam_date", "exams", ["exam_date"])
+
+    op.create_table(
+        "uploaded_images",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("exam_id", sa.String(36), sa.ForeignKey("exams.id"), nullable=False),
+        sa.Column("image_kind", sa.String(30), nullable=False),
+        sa.Column("original_filename", sa.String(255), nullable=False),
+        sa.Column("stored_filename", sa.String(255), nullable=False),
+        sa.Column("storage_path", sa.Text(), nullable=False),
+        sa.Column("sha256", sa.String(64), nullable=False),
+        sa.Column("mime_type", sa.String(100), nullable=False),
+        sa.Column("size_bytes", sa.Integer(), nullable=False),
+        sa.Column("width", sa.Integer(), nullable=True),
+        sa.Column("height", sa.Integer(), nullable=True),
+        sa.Column("uploaded_by_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("uploaded_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_uploaded_images_patient_id", "uploaded_images", ["patient_id"])
+    op.create_index("ix_uploaded_images_exam_id", "uploaded_images", ["exam_id"])
+    op.create_index("ix_uploaded_images_sha256", "uploaded_images", ["sha256"])
+
+    op.create_table(
+        "roi_selections",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("source_image_id", sa.String(36), sa.ForeignKey("uploaded_images.id"), nullable=False),
+        sa.Column("roi_image_id", sa.String(36), sa.ForeignKey("uploaded_images.id"), nullable=False),
+        sa.Column("x", sa.Integer(), nullable=False),
+        sa.Column("y", sa.Integer(), nullable=False),
+        sa.Column("width", sa.Integer(), nullable=False),
+        sa.Column("height", sa.Integer(), nullable=False),
+        sa.Column("created_by_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+
+    op.create_table(
+        "ai_analyses",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("exam_id", sa.String(36), sa.ForeignKey("exams.id"), nullable=False),
+        sa.Column("roi_image_id", sa.String(36), sa.ForeignKey("uploaded_images.id"), nullable=True),
+        sa.Column("full_image_id", sa.String(36), sa.ForeignKey("uploaded_images.id"), nullable=True),
+        sa.Column("roi_selection_id", sa.String(36), sa.ForeignKey("roi_selections.id"), nullable=True),
+        sa.Column("status", sa.String(20), nullable=False),
+        sa.Column("erosion_probability", sa.Float(), nullable=True),
+        sa.Column("threshold", sa.Float(), nullable=True),
+        sa.Column("predicted_class", sa.Integer(), nullable=True),
+        sa.Column("model_version", sa.String(200), nullable=True),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("created_by_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("started_at", sa.DateTime(), nullable=True),
+        sa.Column("completed_at", sa.DateTime(), nullable=True),
+        sa.Column("metadata_json", sa.Text(), nullable=False, server_default="{}"),
+    )
+    op.create_index("ix_ai_analyses_patient_id", "ai_analyses", ["patient_id"])
+    op.create_index("ix_ai_analyses_exam_id", "ai_analyses", ["exam_id"])
+
+    op.create_table(
+        "clinician_reviews",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("analysis_id", sa.String(36), sa.ForeignKey("ai_analyses.id"), nullable=False),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("reviewer_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False),
+        sa.Column("decision", sa.String(30), nullable=True),
+        sa.Column("structured_note_json", sa.Text(), nullable=False, server_default="{}"),
+        sa.Column("free_text", sa.Text(), nullable=True),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("is_current", sa.Boolean(), nullable=False, server_default=sa.text("1")),
+        sa.Column("signed_at", sa.DateTime(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_clinician_reviews_analysis_id", "clinician_reviews", ["analysis_id"])
+    op.create_index("ix_clinician_reviews_patient_id", "clinician_reviews", ["patient_id"])
+
+    op.create_table(
+        "assistant_conversations",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=False),
+        sa.Column("created_by_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+
+    op.create_table(
+        "assistant_messages",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("conversation_id", sa.String(36), sa.ForeignKey("assistant_conversations.id"), nullable=False),
+        sa.Column("role", sa.String(20), nullable=False),
+        sa.Column("content", sa.Text(), nullable=False),
+        sa.Column("citations_json", sa.Text(), nullable=False, server_default="[]"),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+    )
+
+    op.create_table(
+        "audit_logs",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("event_type", sa.String(120), nullable=False),
+        sa.Column("actor_user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=True),
+        sa.Column("patient_id", sa.String(36), sa.ForeignKey("patients.id"), nullable=True),
+        sa.Column("details_json", sa.Text(), nullable=False, server_default="{}"),
+        sa.Column("occurred_at", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_audit_logs_event_type", "audit_logs", ["event_type"])
+    op.create_index("ix_audit_logs_occurred_at", "audit_logs", ["occurred_at"])
+
+
+def downgrade() -> None:
+    op.drop_table("audit_logs")
+    op.drop_table("assistant_messages")
+    op.drop_table("assistant_conversations")
+    op.drop_table("clinician_reviews")
+    op.drop_table("ai_analyses")
+    op.drop_table("roi_selections")
+    op.drop_table("uploaded_images")
+    op.drop_table("exams")
+    op.drop_table("patients")
+    op.drop_table("user_roles")
+    op.drop_table("users")
+    op.drop_table("roles")
+```
+
+FILE: rheumaassist/backend/app/__init__.py
+```python
+# RheumaAssist backend package.
+```
+
+FILE: rheumaassist/backend/app/main.py
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.router import api_router
+from app.core.config import settings
+from app.core.csrf import CSRFMiddleware
+from app.core.errors import register_exception_handlers
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="RheumaAssist (Local API)",
+        version="1.0.0",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.frontend_origin],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # CSRF for cookie-based auth on state-changing requests.
+    app.add_middleware(CSRFMiddleware)
+
+    app.include_router(api_router, prefix="/api")
+    register_exception_handlers(app)
+    return app
+
+
+app = create_app()
+```
+
+FILE: rheumaassist/backend/app/core/__init__.py
+```python
+# Core utilities for the local-first backend.
+```
+
+FILE: rheumaassist/backend/app/core/config.py
+```python
+from pathlib import Path
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    env: str = "development"
+
+    database_url: str = "sqlite:///./data/rheumaassist.db"
+
+    secret_key: str = "change_me"
+    jwt_issuer: str = "rheumaassist-local"
+    access_token_ttl_minutes: int = 480
+
+    cookie_name: str = "ra_access"
+    cookie_secure: bool = False
+    cookie_samesite: str = "lax"
+
+    csrf_cookie_name: str = "ra_csrf"
+    csrf_header_name: str = "X-CSRF-Token"
+
+    frontend_origin: str = "http://localhost:3000"
+
+    max_upload_mb: int = 10
+    allowed_image_types: str = "image/png,image/jpeg"
+
+    model_artifacts_dir: str = "../model_artifacts"
+    uploads_dir: str = "../uploads"
+
+    model_checkpoint_filename: str = "ero_resnet18_checkpoint.pth"
+    model_config_filename: str = "ero_resnet18_config.json"
+    model_scripted_filename: str = "ero_resnet18_scripted.pt"
+    use_torchscript: bool = False
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+    def resolve_path(self, p: str) -> Path:
+        # Resolve relative paths against backend directory (where .env lives).
+        base = Path(__file__).resolve().parents[2]  # backend/app -> backend
+        return (base / p).resolve()
+
+
+settings = Settings()
+```
+
+FILE: rheumaassist/backend/app/core/errors.py
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+
+class AppError(Exception):
+    def __init__(self, message: str, code: str = "app_error", http_status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.http_status = http_status
+
+
+class AuthError(AppError):
+    def __init__(self, message: str = "Authentication failed", code: str = "auth_failed", http_status: int = 401):
+        super().__init__(message, code, http_status)
+
+
+class ForbiddenError(AppError):
+    def __init__(self, message: str = "Forbidden", code: str = "forbidden", http_status: int = 403):
+        super().__init__(message, code, http_status)
+
+
+class NotFoundError(AppError):
+    def __init__(self, message: str = "Not found", code: str = "not_found", http_status: int = 404):
+        super().__init__(message, code, http_status)
+
+
+class ConflictError(AppError):
+    def __init__(self, message: str = "Conflict", code: str = "conflict", http_status: int = 409):
+        super().__init__(message, code, http_status)
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AppError)
+    async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": "internal_error", "message": "An unexpected error occurred."}},
+        )
+```
+
+FILE: rheumaassist/backend/app/core/security.py
+```python
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+import jwt
+
+from app.core.config import settings
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_access_token(user_id: str, roles: list[str]) -> str:
+    exp = now_utc() + timedelta(minutes=settings.access_token_ttl_minutes)
+    payload = {
+        "iss": settings.jwt_issuer,
+        "sub": user_id,
+        "roles": roles,
+        "type": "access",
+        "jti": str(uuid4()),
+        "iat": int(now_utc().timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm="HS256")
+
+
+def decode_token(token: str) -> dict:
+    return jwt.decode(token, settings.secret_key, algorithms=["HS256"], issuer=settings.jwt_issuer)
+```
+
+FILE: rheumaassist/backend/app/core/csrf.py
+```python
+import secrets
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+from app.core.config import settings
+
+
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+class CSRFMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method.upper() in SAFE_METHODS:
+            return await call_next(request)
+
+        # Only enforce CSRF if an auth cookie exists.
+        auth_cookie = request.cookies.get(settings.cookie_name)
+        if not auth_cookie:
+            return await call_next(request)
+
+        csrf_cookie = request.cookies.get(settings.csrf_cookie_name)
+        csrf_header = request.headers.get(settings.csrf_header_name)
+
+        if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"code": "csrf_failed", "message": "CSRF validation failed."}},
+            )
+
+        return await call_next(request)
+```
+
+FILE: rheumaassist/backend/app/core/rate_limit.py
+```python
+import time
+from dataclasses import dataclass
+from threading import Lock
+
+
+@dataclass
+class RateLimitResult:
+    allowed: bool
+    remaining: int
+    reset_seconds: int
+
+
+class InMemoryRateLimiter:
+    """
+    Minimal in-memory fixed-window limiter for local MVP.
+    Not suitable for multi-process production use.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._buckets: dict[str, dict[int, int]] = {}
+
+    def check(self, key: str, limit: int, window_seconds: int) -> RateLimitResult:
+        now = int(time.time())
+        window = now // window_seconds
+
+        with self._lock:
+            win_map = self._buckets.setdefault(key, {})
+            count = win_map.get(window, 0) + 1
+            win_map[window] = count
+
+            # small memory cleanup
+            for w in list(win_map.keys()):
+                if w < window - 2:
+                    del win_map[w]
+
+        remaining = max(0, limit - count)
+        allowed = count <= limit
+        reset_seconds = window_seconds - (now % window_seconds)
+        return RateLimitResult(allowed=allowed, remaining=remaining, reset_seconds=reset_seconds)
+```
+
+FILE: rheumaassist/backend/app/core/audit.py
+```python
+import json
+from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from app.models.audit_log import AuditLog
+
+
+def write_audit_log(
+    db: Session,
+    *,
+    event_type: str,
+    actor_user_id: str | None,
+    patient_id: str | None,
+    details: dict,
+) -> None:
+    log = AuditLog(
+        id=str(uuid4()),
+        event_type=event_type,
+        actor_user_id=actor_user_id,
+        patient_id=patient_id,
+        details_json=json.dumps(details, ensure_ascii=False),
+        occurred_at=datetime.utcnow(),
+    )
+    db.add(log)
+    db.commit()
+```
+
+FILE: rheumaassist/backend/app/db/__init__.py
+```python
+# Database helpers.
+```
+
+FILE: rheumaassist/backend/app/db/base.py
+```python
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+```
+
+FILE: rheumaassist/backend/app/db/session.py
+```python
+from pathlib import Path
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.core.config import settings
+
+
+def _ensure_sqlite_dir(database_url: str) -> None:
+    if not database_url.startswith("sqlite:///"):
+        return
+    rel = database_url.replace("sqlite:///", "", 1)
+    # For relative sqlite url like sqlite:///./data/file.db
+    if rel.startswith("./"):
+        rel = rel[2:]
+    p = Path(__file__).resolve().parents[2] / rel  # backend/<rel>
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_sqlite_dir(settings.database_url)
+
+connect_args = {}
+if settings.database_url.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+```
+
+FILE: rheumaassist/backend/app/db/deps.py
+```python
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+
+
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+FILE: rheumaassist/backend/app/models/__init__.py
+```python
+# SQLAlchemy models package.
+```
+
+FILE: rheumaassist/backend/app/models/role.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Role(Base):
+    __tablename__ = "roles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/user.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, Boolean, Integer, Table, Column, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+
+user_roles = Table(
+    "user_roles",
+    Base.metadata,
+    Column("user_id", String(36), ForeignKey("users.id"), primary_key=True),
+    Column("role_id", String(36), ForeignKey("roles.id"), primary_key=True),
+)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(500), nullable=False)
+
+    is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
+
+    failed_login_attempts: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+    roles = relationship("Role", secondary="user_roles", lazy="joined")
+
+    def has_role(self, role_name: str) -> bool:
+        return any(r.name == role_name for r in self.roles)
+```
+
+FILE: rheumaassist/backend/app/models/patient.py
+```python
+from datetime import datetime, date
+from sqlalchemy import String, Date, DateTime, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Patient(Base):
+    __tablename__ = "patients"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    patient_id: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)  # public hospital-facing ID
+    hospital_number: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    date_of_birth: Mapped[date] = mapped_column(Date(), nullable=False)
+    sex: Mapped[str] = mapped_column(String(20), nullable=False)  # female/male/other
+
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/exam.py
+```python
+from datetime import datetime, date
+from sqlalchemy import String, Date, DateTime, ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Exam(Base):
+    __tablename__ = "exams"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
+
+    exam_date: Mapped[date] = mapped_column(Date(), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/uploaded_image.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Integer, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class UploadedImage(Base):
+    __tablename__ = "uploaded_images"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+    patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
+    exam_id: Mapped[str] = mapped_column(String(36), ForeignKey("exams.id"), nullable=False)
+
+    image_kind: Mapped[str] = mapped_column(String(30), nullable=False)  # ROI_DIRECT / FULL_RADIOGRAPH / ROI_CROPPED
+
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    stored_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_path: Mapped[str] = mapped_column(Text(), nullable=False)
+
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer(), nullable=False)
+
+    width: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+
+    uploaded_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/roi_selection.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Integer
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class ROISelection(Base):
+    __tablename__ = "roi_selections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+    source_image_id: Mapped[str] = mapped_column(String(36), ForeignKey("uploaded_images.id"), nullable=False)
+    roi_image_id: Mapped[str] = mapped_column(String(36), ForeignKey("uploaded_images.id"), nullable=False)
+
+    x: Mapped[int] = mapped_column(Integer(), nullable=False)
+    y: Mapped[int] = mapped_column(Integer(), nullable=False)
+    width: Mapped[int] = mapped_column(Integer(), nullable=False)
+    height: Mapped[int] = mapped_column(Integer(), nullable=False)
+
+    created_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/ai_analysis.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Float, Integer, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class AIAnalysis(Base):
+    __tablename__ = "ai_analyses"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+    patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
+    exam_id: Mapped[str] = mapped_column(String(36), ForeignKey("exams.id"), nullable=False)
+
+    roi_image_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("uploaded_images.id"), nullable=True)
+    full_image_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("uploaded_images.id"), nullable=True)
+    roi_selection_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("roi_selections.id"), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # PENDING/RUNNING/SUCCESS/FAILED
+
+    erosion_probability: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    threshold: Mapped[float | None] = mapped_column(Float(), nullable=True)
+    predicted_class: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+
+    model_version: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    created_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
+    metadata_json: Mapped[str] = mapped_column(Text(), nullable=False, default="{}")
+```
+
+FILE: rheumaassist/backend/app/models/clinician_review.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Integer, Text, Boolean
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class ClinicianReview(Base):
+    __tablename__ = "clinician_reviews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+
+    analysis_id: Mapped[str] = mapped_column(String(36), ForeignKey("ai_analyses.id"), nullable=False)
+    patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
+
+    reviewer_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # DRAFT/FINAL
+    decision: Mapped[str | None] = mapped_column(String(30), nullable=True)  # CONFIRMED/NOT_CONFIRMED/UNCERTAIN
+
+    structured_note_json: Mapped[str] = mapped_column(Text(), nullable=False, default="{}")
+    free_text: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
+    version: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
+    is_current: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
+
+    signed_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/assistant.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class AssistantConversation(Base):
+    __tablename__ = "assistant_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    patient_id: Mapped[str] = mapped_column(String(36), ForeignKey("patients.id"), nullable=False)
+    created_by_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+
+
+class AssistantMessage(Base):
+    __tablename__ = "assistant_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), ForeignKey("assistant_conversations.id"), nullable=False)
+
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user/assistant
+    content: Mapped[str] = mapped_column(Text(), nullable=False)
+    citations_json: Mapped[str] = mapped_column(Text(), nullable=False, default="[]")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/models/audit_log.py
+```python
+from datetime import datetime
+from sqlalchemy import String, DateTime, ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    actor_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    patient_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("patients.id"), nullable=True)
+
+    details_json: Mapped[str] = mapped_column(Text(), nullable=False, default="{}")
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
+```
+
+FILE: rheumaassist/backend/app/schemas/__init__.py
+```python
+# Pydantic schemas.
+```
+
+FILE: rheumaassist/backend/app/schemas/auth.py
+```python
+from pydantic import BaseModel, EmailStr, Field
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=200)
+    remember_me: bool = False
+
+
+class MeResponse(BaseModel):
+    user_id: str
+    email: EmailStr
+    full_name: str
+    roles: list[str]
+```
+
+FILE: rheumaassist/backend/app/api/__init__.py
+```python
+# API router package.
+```
+
+FILE: rheumaassist/backend/app/api/router.py
+```python
+from fastapi import APIRouter
+
+from app.api.routes.health import router as health_router
+from app.api.routes.auth import router as auth_router
+from app.api.routes.patients import router as patients_router
+from app.api.routes.analyses import router as analyses_router
+from app.api.routes.reviews import router as reviews_router
+from app.api.routes.images import router as images_router
+from app.api.routes.assistant import router as assistant_router
+from app.api.routes.admin import router as admin_router
+from app.api.routes.audit import router as audit_router
+
+api_router = APIRouter()
+
+api_router.include_router(health_router, tags=["health"])
+api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
+api_router.include_router(patients_router, prefix="/patients", tags=["patients"])
+api_router.include_router(analyses_router, prefix="/analyses", tags=["analyses"])
+api_router.include_router(reviews_router, prefix="/reviews", tags=["reviews"])
+api_router.include_router(images_router, prefix="/images", tags=["images"])
+api_router.include_router(assistant_router, prefix="/assistant", tags=["assistant"])
+api_router.include_router(admin_router, prefix="/admin", tags=["admin"])
+api_router.include_router(audit_router, prefix="/audit", tags=["audit"])
+```
+
+FILE: rheumaassist/backend/app/api/routes/__init__.py
+```python
+# Route modules.
+```
+
+FILE: rheumaassist/backend/app/api/routes/health.py
+```python
+from fastapi import APIRouter
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+```
+
+FILE: rheumaassist/backend/app/services/__init__.py
+```python
+# Service layer.
+```
+
+FILE: rheumaassist/backend/app/services/password_service.py
+```python
+from passlib.context import CryptContext
+
+from app.core.errors import AppError
+
+
+class PasswordService:
+    def __init__(self) -> None:
+        self._ctx = CryptContext(schemes=["argon2"], deprecated="auto")
+
+    def hash_password(self, password: str) -> str:
+        if len(password) < 10:
+            raise AppError("Password must be at least 10 characters long.", code="weak_password", http_status=400)
+        return self._ctx.hash(password)
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        try:
+            return self._ctx.verify(password, password_hash)
+        except Exception:
+            return False
+```
+
+FILE: rheumaassist/backend/app/services/token_service.py
+```python
+from app.core.security import create_access_token, decode_token
+
+
+class TokenService:
+    def create_access(self, user_id: str, roles: list[str]) -> str:
+        return create_access_token(user_id=user_id, roles=roles)
+
+    def decode(self, token: str) -> dict:
+        return decode_token(token)
+```
+
+FILE: rheumaassist/backend/app/services/auth_service.py
+```python
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Response
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.csrf import generate_csrf_token
+from app.core.errors import AuthError
+from app.models.user import User
+from app.services.password_service import PasswordService
+from app.services.token_service import TokenService
+
+
+class AuthService:
+    def __init__(self) -> None:
+        self._passwords = PasswordService()
+        self._tokens = TokenService()
+
+    def login(self, db: Session, *, email: str, password: str, remember_me: bool, response: Response) -> User:
+        user = db.query(User).filter(User.email == email.lower().strip()).first()
+        if not user or not user.is_active:
+            raise AuthError("Invalid credentials.", http_status=401)
+
+        # lockout
+        if user.locked_until and user.locked_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+            raise AuthError("Account locked. Try again later.", http_status=403)
+
+        if not self._passwords.verify_password(password, user.password_hash):
+            user.failed_login_attempts += 1
+            if user.failed_login_attempts >= 8:
+                user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+                user.failed_login_attempts = 0
+            db.add(user)
+            db.commit()
+            raise AuthError("Invalid credentials.", http_status=401)
+
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.last_login_at = datetime.utcnow()
+        db.add(user)
+        db.commit()
+
+        roles = [r.name for r in user.roles]
+
+        access = self._tokens.create_access(user.id, roles)
+
+        ttl_minutes = settings.access_token_ttl_minutes
+        if remember_me:
+            ttl_minutes = max(ttl_minutes, 24 * 60)
+
+        response.set_cookie(
+            settings.cookie_name,
+            access,
+            httponly=True,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_samesite,
+            max_age=ttl_minutes * 60,
+            path="/",
+        )
+
+        # Double-submit CSRF token
+        csrf = generate_csrf_token()
+        response.set_cookie(
+            settings.csrf_cookie_name,
+            csrf,
+            httponly=False,
+            secure=settings.cookie_secure,
+            samesite=settings.cookie_samesite,
+            max_age=ttl_minutes * 60,
+            path="/",
+        )
+
+        return user
+
+    def logout(self, response: Response) -> None:
+        response.delete_cookie(settings.cookie_name, path="/")
+        response.delete_cookie(settings.csrf_cookie_name, path="/")
+```
+
+FILE: rheumaassist/backend/app/services/storage_service.py
+```python
+import hashlib
+import io
+from pathlib import Path
+from uuid import uuid4
+
+from PIL import Image as PILImage
+
+from app.core.config import settings
+from app.core.errors import AppError
+
+
+class StoredFile:
+    def __init__(self, *, stored_filename: str, storage_path: str, sha256: str, mime_type: str, size_bytes: int, width: int, height: int):
+        self.stored_filename = stored_filename
+        self.storage_path = storage_path
+        self.sha256 = sha256
+        self.mime_type = mime_type
+        self.size_bytes = size_bytes
+        self.width = width
+        self.height = height
+
+
+class StorageService:
+    def __init__(self) -> None:
+        self._uploads_dir = settings.resolve_path(settings.uploads_dir)
+        self._uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        allowed = [x.strip() for x in settings.allowed_image_types.split(",") if x.strip()]
+        self._allowed_mime = set(allowed)
+
+    def store_image_bytes(self, *, original_filename: str, data: bytes) -> StoredFile:
+        if len(data) > settings.max_upload_mb * 1024 * 1024:
+            raise AppError("File too large.", code="file_too_large", http_status=413)
+
+        # Validate by decoding with PIL + verify format
+        try:
+            img = PILImage.open(io.BytesIO(data))
+            img.verify()
+        except Exception:
+            raise AppError("Invalid image file.", code="invalid_image", http_status=400)
+
+        img = PILImage.open(io.BytesIO(data))
+        fmt = (img.format or "").upper()
+        if fmt not in {"PNG", "JPEG", "JPG"}:
+            raise AppError("Only PNG and JPEG are supported in V1.", code="unsupported_format", http_status=400)
+
+        mime = "image/png" if fmt == "PNG" else "image/jpeg"
+        if mime not in self._allowed_mime:
+            raise AppError("Unsupported MIME type.", code="unsupported_mime", http_status=400)
+
+        width, height = img.size
+        sha256 = hashlib.sha256(data).hexdigest()
+
+        ext = "png" if mime == "image/png" else "jpg"
+        stored_filename = f"{uuid4()}.{ext}"
+
+        dest = (self._uploads_dir / stored_filename).resolve()
+        if not str(dest).startswith(str(self._uploads_dir.resolve())):
+            raise AppError("Invalid storage path.", code="invalid_storage_path", http_status=400)
+
+        dest.write_bytes(data)
+
+        return StoredFile(
+            stored_filename=stored_filename,
+            storage_path=str(dest),
+            sha256=sha256,
+            mime_type=mime,
+            size_bytes=len(data),
+            width=width,
+            height=height,
+        )
+```
+
+FILE: rheumaassist/backend/app/ai/__init__.py
+```python
+# CPU-only erosion inference.
+```
+
+FILE: rheumaassist/backend/app/ai/model_arch.py
+```python
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+
+class EROBinaryResNet18(nn.Module):
+    def __init__(self, dropout: float = 0.6):
+        super().__init__()
+        self.backbone = models.resnet18(weights=None)
+        in_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(in_features, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x).squeeze(1)
+```
+
+FILE: rheumaassist/backend/app/ai/model_loader.py
+```python
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from app.core.config import settings
+from app.core.errors import AppError
+from app.ai.model_arch import EROBinaryResNet18
+
+
+@dataclass
+class LoadedModel:
+    model: Any  # torch.nn.Module or torch.jit.ScriptModule
+    config: dict[str, Any]
+
+
+_cached: LoadedModel | None = None
+
+
+def _path(base_dir: str, filename: str) -> Path:
+    base = settings.resolve_path(base_dir)
+    return (base / filename).resolve()
+
+
+def load_model() -> LoadedModel:
+    global _cached
+    if _cached is not None:
+        return _cached
+
+    cfg_path = _path(settings.model_artifacts_dir, settings.model_config_filename)
+    ckpt_path = _path(settings.model_artifacts_dir, settings.model_checkpoint_filename)
+    ts_path = _path(settings.model_artifacts_dir, settings.model_scripted_filename)
+
+    if not cfg_path.exists():
+        raise AppError(f"Model config missing: {cfg_path.name}", code="model_config_missing", http_status=500)
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    device = torch.device("cpu")
+
+    if settings.use_torchscript:
+        if not ts_path.exists():
+            raise AppError("TorchScript requested but file is missing.", code="model_torchscript_missing", http_status=500)
+        model = torch.jit.load(str(ts_path), map_location=device)
+        model.eval()
+        _cached = LoadedModel(model=model, config=cfg)
+        return _cached
+
+    if not ckpt_path.exists():
+        raise AppError(f"Model checkpoint missing: {ckpt_path.name}", code="model_checkpoint_missing", http_status=500)
+
+    # Safer load when supported by the installed PyTorch version
+    try:
+        checkpoint = torch.load(str(ckpt_path), map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(str(ckpt_path), map_location=device)
+
+    dropout = float(checkpoint.get("dropout", cfg.get("dropout", 0.6)))
+    model = EROBinaryResNet18(dropout=dropout)
+
+    state = checkpoint.get("state_dict")
+    if not state:
+        raise AppError("Checkpoint does not contain state_dict.", code="invalid_checkpoint", http_status=500)
+
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+
+    merged = dict(cfg)
+    merged["threshold"] = float(checkpoint.get("threshold", cfg.get("threshold", 0.314)))
+    merged["train_mean"] = checkpoint.get("train_mean", cfg.get("train_mean", [0.0, 0.0, 0.0]))
+    merged["train_std"] = checkpoint.get("train_std", cfg.get("train_std", [1.0, 1.0, 1.0]))
+    merged["model_version"] = checkpoint.get("model_class", cfg.get("model_class", "EROBinaryResNet18"))
+
+    _cached = LoadedModel(model=model, config=merged)
+    return _cached
+```
+
+FILE: rheumaassist/backend/app/ai/preprocess.py
+```python
+from typing import Any
+from PIL import Image
+import torch
+from torchvision import transforms
+
+
+def preprocess_image(path: str, *, mean: list[float], std: list[float]) -> tuple[torch.Tensor, dict[str, Any]]:
+    img = Image.open(path)
+
+    # Enforce consistent preprocessing:
+    # - grayscale if needed
+    # - convert to 3 channels
+    img = img.convert("L").convert("RGB")
+
+    tf = transforms.Compose(
+        [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+    x = tf(img).unsqueeze(0)  # (1,3,224,224)
+
+    meta = {"conversion": "L->RGB", "resize": [224, 224]}
+    return x, meta
+```
+
+FILE: rheumaassist/backend/app/ai/inference.py
+```python
+from typing import Any
+import torch
+
+from app.ai.model_loader import load_model
+from app.ai.preprocess import preprocess_image
+
+
+@torch.no_grad()
+def infer_erosion(image_path: str) -> dict[str, Any]:
+    loaded = load_model()
+    cfg = loaded.config
+
+    threshold = float(cfg.get("threshold", 0.314))
+    mean = cfg.get("train_mean", [0.0, 0.0, 0.0])
+    std = cfg.get("train_std", [1.0, 1.0, 1.0])
+
+    x, preprocess_meta = preprocess_image(image_path, mean=mean, std=std)
+    x = x.to("cpu")
+
+    logits = loaded.model(x)
+    prob = torch.sigmoid(logits).item()
+    pred = 1 if prob >= threshold else 0
+
+    return {
+        "probability": float(prob),
+        "predicted_class": int(pred),
+        "threshold": float(threshold),
+        "model_version": str(cfg.get("model_version", "EROBinaryResNet18")),
+        "preprocess": preprocess_meta,
+    }
+```
+
+FILE: rheumaassist/backend/app/services/patient_service.py
+```python
+from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from app.core.errors import ConflictError, NotFoundError
+from app.models.patient import Patient
+
+
+class PatientService:
+    def create_patient(
+        self,
+        db: Session,
+        *,
+        patient_id: str,
+        hospital_number: str,
+        full_name: str,
+        date_of_birth,
+        sex: str,
+        notes: str | None,
+    ) -> Patient:
+        exists = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if exists:
+            raise ConflictError("Patient ID already exists.", http_status=409)
+
+        now = datetime.utcnow()
+        p = Patient(
+            id=str(uuid4()),
+            patient_id=patient_id,
+            hospital_number=hospital_number,
+            full_name=full_name,
+            date_of_birth=date_of_birth,
+            sex=sex,
+            notes=notes,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(p)
+        db.commit()
+        db.refresh(p)
+        return p
+
+    def get_by_patient_id(self, db: Session, patient_id: str) -> Patient:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise NotFoundError("Patient not found.", http_status=404)
+        return p
+```
+
+FILE: rheumaassist/backend/app/api/routes/auth.py
+```python
+from fastapi import APIRouter, Depends, Request, Response
+from sqlalchemy.orm import Session
+
+from app.core.rate_limit import InMemoryRateLimiter
+from app.core.errors import AuthError
+from app.core.audit import write_audit_log
+from app.db.deps import get_db
+from app.models.user import User
+from app.schemas.auth import LoginRequest, MeResponse
+from app.services.auth_service import AuthService
+from app.services.admin_service import AuthDeps
+
+router = APIRouter()
+limiter = InMemoryRateLimiter()
+
+
+@router.post("/login", response_model=MeResponse)
+def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> MeResponse:
+    ip = request.client.host if request.client else "unknown"
+    rl = limiter.check(f"login:{ip}:{payload.email}", limit=15, window_seconds=300)
+    if not rl.allowed:
+        raise AuthError("Too many login attempts. Please wait and try again.", http_status=429)
+
+    svc = AuthService()
+    user = svc.login(db, email=str(payload.email), password=payload.password, remember_me=payload.remember_me, response=response)
+
+    write_audit_log(
+        db,
+        event_type="auth.login",
+        actor_user_id=user.id,
+        patient_id=None,
+        details={"email": user.email},
+    )
+
+    return MeResponse(
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        roles=[r.name for r in user.roles],
+    )
+
+
+@router.post("/logout")
+def logout(response: Response, db: Session = Depends(get_db), user: User = Depends(AuthDeps.require_user)) -> dict:
+    AuthService().logout(response)
+    write_audit_log(db, event_type="auth.logout", actor_user_id=user.id, patient_id=None, details={})
+    return {"status": "ok"}
+
+
+@router.get("/me", response_model=MeResponse)
+def me(user: User = Depends(AuthDeps.require_user)) -> MeResponse:
+    return MeResponse(
+        user_id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        roles=[r.name for r in user.roles],
+    )
+```
+
+FILE: rheumaassist/backend/app/services/admin_service.py
+```python
+from datetime import datetime, timezone
+
+from fastapi import Depends, Request
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.errors import AuthError, ForbiddenError
+from app.core.security import decode_token
+from app.db.deps import get_db
+from app.models.user import User
+
+
+class AuthDeps:
+    @staticmethod
+    def require_user(request: Request, db: Session = Depends(get_db)) -> User:
+        token = request.cookies.get(settings.cookie_name)
+        if not token:
+            raise AuthError("Not authenticated.", http_status=401)
+
+        try:
+            payload = decode_token(token)
+        except Exception:
+            raise AuthError("Invalid session.", http_status=401)
+
+        if payload.get("type") != "access":
+            raise AuthError("Invalid session type.", http_status=401)
+
+        user_id = payload.get("sub")
+        if not user_id:
+            raise AuthError("Invalid session payload.", http_status=401)
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user or not user.is_active:
+            raise AuthError("Account disabled.", http_status=401)
+
+        if user.locked_until and user.locked_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+            raise AuthError("Account locked. Try again later.", http_status=403)
+
+        return user
+
+    @staticmethod
+    def require_roles(*roles: str):
+        def _dep(user: User = Depends(AuthDeps.require_user)) -> User:
+            if any(user.has_role(r) for r in roles):
+                return user
+            raise ForbiddenError("Insufficient privileges.", http_status=403)
+
+        return _dep
+```
+
+FILE: rheumaassist/backend/app/api/routes/patients.py
+```python
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from app.core.audit import write_audit_log
+from app.db.deps import get_db
+from app.models.patient import Patient
+from app.schemas.patient import PatientCreate, PatientListResponse, PatientResponse
+from app.services.patient_service import PatientService
+from app.services.admin_service import AuthDeps
+from app.models.user import User
+
+router = APIRouter()
+
+
+@router.get("", response_model=PatientListResponse)
+def list_patients(
+    q: str | None = Query(default=None, description="Search by patient ID, hospital number, or name."),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_user),
+) -> PatientListResponse:
+    query = db.query(Patient)
+
+    if q:
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (Patient.patient_id.ilike(like)) |
+            (Patient.hospital_number.ilike(like)) |
+            (Patient.full_name.ilike(like))
+        )
+
+    total = query.count()
+    items = query.order_by(Patient.updated_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    return PatientListResponse(
+        page=page,
+        page_size=page_size,
+        total=total,
+        items=[
+            PatientResponse(
+                id=p.id,
+                patient_id=p.patient_id,
+                hospital_number=p.hospital_number,
+                full_name=p.full_name,
+                date_of_birth=p.date_of_birth,
+                sex=p.sex,
+                notes=p.notes,
+                created_at=p.created_at,
+                updated_at=p.updated_at,
+            )
+            for p in items
+        ],
+    )
+
+
+@router.post("", response_model=PatientResponse)
+def create_patient(
+    payload: PatientCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_roles("Admin", "Rheumatologist", "Resident")),
+) -> PatientResponse:
+    svc = PatientService()
+    p = svc.create_patient(
+        db,
+        patient_id=payload.patient_id,
+        hospital_number=payload.hospital_number,
+        full_name=payload.full_name,
+        date_of_birth=payload.date_of_birth,
+        sex=payload.sex,
+        notes=payload.notes,
+    )
+
+    write_audit_log(db, event_type="patient.create", actor_user_id=user.id, patient_id=p.id, details={"patient_id": p.patient_id})
+
+    return PatientResponse(
+        id=p.id,
+        patient_id=p.patient_id,
+        hospital_number=p.hospital_number,
+        full_name=p.full_name,
+        date_of_birth=p.date_of_birth,
+        sex=p.sex,
+        notes=p.notes,
+        created_at=p.created_at,
+        updated_at=p.updated_at,
+    )
+
+
+@router.get("/{patient_id}", response_model=PatientResponse)
+def get_patient(
+    patient_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_user),
+) -> PatientResponse:
+    svc = PatientService()
+    p = svc.get_by_patient_id(db, patient_id)
+
+    return PatientResponse(
+        id=p.id,
+        patient_id=p.patient_id,
+        hospital_number=p.hospital_number,
+        full_name=p.full_name,
+        date_of_birth=p.date_of_birth,
+        sex=p.sex,
+        notes=p.notes,
+        created_at=p.created_at,
+        updated_at=p.updated_at,
+    )
+```
+
+FILE: rheumaassist/backend/app/schemas/patient.py
+```python
+from datetime import date, datetime
+from pydantic import BaseModel, Field
+
+
+class PatientCreate(BaseModel):
+    patient_id: str = Field(min_length=2, max_length=50)
+    hospital_number: str = Field(min_length=2, max_length=50)
+    full_name: str = Field(min_length=2, max_length=200)
+    date_of_birth: date
+    sex: str = Field(pattern="^(female|male|other)$")
+    notes: str | None = Field(default=None, max_length=5000)
+
+
+class PatientResponse(BaseModel):
+    id: str
+    patient_id: str
+    hospital_number: str
+    full_name: str
+    date_of_birth: date
+    sex: str
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PatientListResponse(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    items: list[PatientResponse]
+```
+
+FILE: rheumaassist/backend/app/api/routes/analyses.py
+```python
+from fastapi import APIRouter, Depends, File, Form, UploadFile
+from sqlalchemy.orm import Session
+
+from app.core.audit import write_audit_log
+from app.db.deps import get_db
+from app.schemas.analysis import AnalysisCreateResponse, AnalysisDetailResponse, AnalysisListResponse
+from app.services.analysis_service import AnalysisService
+from app.services.admin_service import AuthDeps
+from app.models.user import User
+
+router = APIRouter()
+
+
+@router.post("", response_model=AnalysisCreateResponse)
+def create_analysis(
+    patient_id: str = Form(..., description="Patient public ID (e.g., P-0001)"),
+    exam_date: str = Form(..., description="YYYY-MM-DD"),
+    mode: str = Form(..., description="ROI_DIRECT or FULL_WITH_MANUAL_ROI"),
+
+    roi_image: UploadFile = File(...),
+    full_image: UploadFile | None = File(default=None),
+
+    roi_x: int | None = Form(default=None),
+    roi_y: int | None = Form(default=None),
+    roi_width: int | None = Form(default=None),
+    roi_height: int | None = Form(default=None),
+
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_roles("Admin", "Rheumatologist", "Resident")),
+) -> AnalysisCreateResponse:
+    svc = AnalysisService()
+    analysis = svc.create_and_run(
+        db,
+        actor_user=user,
+        patient_public_id=patient_id,
+        exam_date_iso=exam_date,
+        mode=mode,
+        roi_image=roi_image,
+        full_image=full_image,
+        roi_meta={"x": roi_x, "y": roi_y, "width": roi_width, "height": roi_height},
+    )
+
+    write_audit_log(
+        db,
+        event_type="analysis.create",
+        actor_user_id=user.id,
+        patient_id=analysis.patient_id,
+        details={"analysis_id": analysis.id, "mode": mode},
+    )
+
+    return AnalysisCreateResponse(analysis_id=analysis.id)
+
+
+@router.get("/{analysis_id}", response_model=AnalysisDetailResponse)
+def get_analysis(
+    analysis_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_user),
+) -> AnalysisDetailResponse:
+    return AnalysisService().get_detail(db, analysis_id=analysis_id)
+
+
+@router.get("/by-patient/{patient_id}", response_model=AnalysisListResponse)
+def list_analyses_by_patient(
+    patient_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_user),
+) -> AnalysisListResponse:
+    return AnalysisService().list_by_patient_public_id(db, patient_public_id=patient_id)
+```
+
+FILE: rheumaassist/backend/app/services/analysis_service.py
+```python
+import json
+from datetime import datetime, date
+from uuid import uuid4
+
+from fastapi import UploadFile
+from sqlalchemy.orm import Session
+
+from app.ai.inference import infer_erosion
+from app.core.errors import AppError, NotFoundError
+from app.models.patient import Patient
+from app.models.exam import Exam
+from app.models.uploaded_image import UploadedImage
+from app.models.roi_selection import ROISelection
+from app.models.ai_analysis import AIAnalysis
+from app.services.storage_service import StorageService
+from app.models.user import User
+
+
+class AnalysisService:
+    def create_and_run(
+        self,
+        db: Session,
+        *,
+        actor_user: User,
+        patient_public_id: str,
+        exam_date_iso: str,
+        mode: str,
+        roi_image: UploadFile,
+        full_image: UploadFile | None,
+        roi_meta: dict,
+    ) -> AIAnalysis:
+        patient = db.query(Patient).filter(Patient.patient_id == patient_public_id).first()
+        if not patient:
+            raise NotFoundError("Patient not found.", http_status=404)
+
+        try:
+            exam_date_obj = date.fromisoformat(exam_date_iso)
+        except Exception:
+            raise AppError("Invalid exam_date. Use YYYY-MM-DD.", code="invalid_exam_date", http_status=400)
+
+        if mode not in {"ROI_DIRECT", "FULL_WITH_MANUAL_ROI"}:
+            raise AppError("Invalid mode.", code="invalid_mode", http_status=400)
+
+        if mode == "FULL_WITH_MANUAL_ROI" and full_image is None:
+            raise AppError("Full radiograph image is required for FULL_WITH_MANUAL_ROI.", code="missing_full_image", http_status=400)
+
+        now = datetime.utcnow()
+
+        exam = Exam(
+            id=str(uuid4()),
+            patient_id=patient.id,
+            exam_date=exam_date_obj,
+            created_by_user_id=actor_user.id,
+            notes=None,
+            created_at=now,
+        )
+        db.add(exam)
+        db.commit()
+        db.refresh(exam)
+
+        storage = StorageService()
+
+        roi_bytes = roi_image.file.read()
+        roi_store = storage.store_image_bytes(original_filename=roi_image.filename or "roi", data=roi_bytes)
+
+        roi_rec = UploadedImage(
+            id=str(uuid4()),
+            patient_id=patient.id,
+            exam_id=exam.id,
+            image_kind="ROI_DIRECT" if mode == "ROI_DIRECT" else "ROI_CROPPED",
+            original_filename=roi_image.filename or "roi",
+            stored_filename=roi_store.stored_filename,
+            storage_path=roi_store.storage_path,
+            sha256=roi_store.sha256,
+            mime_type=roi_store.mime_type,
+            size_bytes=roi_store.size_bytes,
+            width=roi_store.width,
+            height=roi_store.height,
+            uploaded_by_user_id=actor_user.id,
+            uploaded_at=now,
+        )
+        db.add(roi_rec)
+        db.commit()
+        db.refresh(roi_rec)
+
+        full_rec = None
+        roi_sel = None
+
+        if mode == "FULL_WITH_MANUAL_ROI" and full_image is not None:
+            full_bytes = full_image.file.read()
+            full_store = storage.store_image_bytes(original_filename=full_image.filename or "full", data=full_bytes)
+
+            full_rec = UploadedImage(
+                id=str(uuid4()),
+                patient_id=patient.id,
+                exam_id=exam.id,
+                image_kind="FULL_RADIOGRAPH",
+                original_filename=full_image.filename or "full",
+                stored_filename=full_store.stored_filename,
+                storage_path=full_store.storage_path,
+                sha256=full_store.sha256,
+                mime_type=full_store.mime_type,
+                size_bytes=full_store.size_bytes,
+                width=full_store.width,
+                height=full_store.height,
+                uploaded_by_user_id=actor_user.id,
+                uploaded_at=now,
+            )
+            db.add(full_rec)
+            db.commit()
+            db.refresh(full_rec)
+
+            if all(roi_meta.get(k) is not None for k in ["x", "y", "width", "height"]):
+                roi_sel = ROISelection(
+                    id=str(uuid4()),
+                    source_image_id=full_rec.id,
+                    roi_image_id=roi_rec.id,
+                    x=int(roi_meta["x"]),
+                    y=int(roi_meta["y"]),
+                    width=int(roi_meta["width"]),
+                    height=int(roi_meta["height"]),
+                    created_by_user_id=actor_user.id,
+                    created_at=now,
+                )
+                db.add(roi_sel)
+                db.commit()
+                db.refresh(roi_sel)
+
+        analysis = AIAnalysis(
+            id=str(uuid4()),
+            patient_id=patient.id,
+            exam_id=exam.id,
+            roi_image_id=roi_rec.id,
+            full_image_id=full_rec.id if full_rec else None,
+            roi_selection_id=roi_sel.id if roi_sel else None,
+            status="RUNNING",
+            erosion_probability=None,
+            threshold=None,
+            predicted_class=None,
+            model_version=None,
+            error_message=None,
+            created_by_user_id=actor_user.id,
+            created_at=now,
+            started_at=now,
+            completed_at=None,
+            metadata_json=json.dumps(
+                {
+                    "mode": mode,
+                    "warnings": ["Prediction quality depends on image quality and ROI selection."]
+                    if mode == "FULL_WITH_MANUAL_ROI"
+                    else [],
+                }
+            ),
+        )
+        db.add(analysis)
+        db.commit()
+        db.refresh(analysis)
+
+        # Run real inference on CPU (no fake output)
+        try:
+            res = infer_erosion(roi_rec.storage_path)
+            analysis.status = "SUCCESS"
+            analysis.erosion_probability = float(res["probability"])
+            analysis.threshold = float(res["threshold"])
+            analysis.predicted_class = int(res["predicted_class"])
+            analysis.model_version = str(res["model_version"])
+            analysis.completed_at = datetime.utcnow()
+            analysis.metadata_json = json.dumps(
+                {
+                    **json.loads(analysis.metadata_json),
+                    "preprocess": res["preprocess"],
+                }
+            )
+            db.add(analysis)
+            db.commit()
+        except AppError as e:
+            analysis.status = "FAILED"
+            analysis.error_message = e.message
+            analysis.completed_at = datetime.utcnow()
+            db.add(analysis)
+            db.commit()
+            raise
+        except Exception:
+            analysis.status = "FAILED"
+            analysis.error_message = "Inference failed. Verify model artifacts and image validity."
+            analysis.completed_at = datetime.utcnow()
+            db.add(analysis)
+            db.commit()
+            raise AppError(analysis.error_message, code="inference_failed", http_status=500)
+
+        return analysis
+
+    def get_detail(self, db: Session, *, analysis_id: str):
+        a = db.query(AIAnalysis).filter(AIAnalysis.id == analysis_id).first()
+        if not a:
+            raise NotFoundError("Analysis not found.", http_status=404)
+
+        exam = db.query(Exam).filter(Exam.id == a.exam_id).first()
+        patient = db.query(Patient).filter(Patient.id == a.patient_id).first()
+
+        return {
+            "id": a.id,
+            "status": a.status,
+            "patient": {
+                "id": patient.id,
+                "patient_id": patient.patient_id,
+                "full_name": patient.full_name,
+            } if patient else None,
+            "exam": {
+                "id": exam.id,
+                "exam_date": str(exam.exam_date),
+            } if exam else None,
+            "erosion_probability": a.erosion_probability,
+            "threshold": a.threshold,
+            "predicted_class": a.predicted_class,
+            "model_version": a.model_version,
+            "created_at": a.created_at,
+            "started_at": a.started_at,
+            "completed_at": a.completed_at,
+            "roi_image_id": a.roi_image_id,
+            "full_image_id": a.full_image_id,
+            "roi_selection_id": a.roi_selection_id,
+            "error_message": a.error_message,
+            "metadata": json.loads(a.metadata_json or "{}"),
+        }
+
+    def list_by_patient_public_id(self, db: Session, *, patient_public_id: str):
+        p = db.query(Patient).filter(Patient.patient_id == patient_public_id).first()
+        if not p:
+            raise NotFoundError("Patient not found.", http_status=404)
+
+        items = (
+            db.query(AIAnalysis)
+            .filter(AIAnalysis.patient_id == p.id)
+            .order_by(AIAnalysis.created_at.desc())
+            .all()
+        )
+
+        out = []
+        for a in items:
+            exam = db.query(Exam).filter(Exam.id == a.exam_id).first()
+            out.append(
+                {
+                    "id": a.id,
+                    "status": a.status,
+                    "exam_date": str(exam.exam_date) if exam else None,
+                    "erosion_probability": a.erosion_probability,
+                    "predicted_class": a.predicted_class,
+                    "model_version": a.model_version,
+                    "created_at": a.created_at,
+                }
+            )
+
+        return {"patient_id": p.patient_id, "items": out}
+```
+
+FILE: rheumaassist/backend/app/schemas/analysis.py
+```python
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class AnalysisCreateResponse(BaseModel):
+    analysis_id: str
+
+
+class AnalysisItem(BaseModel):
+    id: str
+    status: str
+    exam_date: str | None
+    erosion_probability: float | None
+    predicted_class: int | None
+    model_version: str | None
+    created_at: datetime
+
+
+class AnalysisListResponse(BaseModel):
+    patient_id: str
+    items: list[AnalysisItem]
+
+
+class AnalysisPatient(BaseModel):
+    id: str
+    patient_id: str
+    full_name: str
+
+
+class AnalysisExam(BaseModel):
+    id: str
+    exam_date: str
+
+
+class AnalysisDetailResponse(BaseModel):
+    id: str
+    status: str
+
+    patient: AnalysisPatient | None
+    exam: AnalysisExam | None
+
+    erosion_probability: float | None
+    threshold: float | None
+    predicted_class: int | None
+    model_version: str | None
+
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    roi_image_id: str | None
+    full_image_id: str | None
+    roi_selection_id: str | None
+
+    error_message: str | None
+    metadata: dict
+```
+
+FILE: rheumaassist/backend/app/api/routes/images.py
+```python
+import os
+from fastapi import APIRouter, Depends
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+
+from app.core.errors import NotFoundError
+from app.db.deps import get_db
+from app.models.uploaded_image import UploadedImage
+from app.services.admin_service import AuthDeps
+
+router = APIRouter()
+
+
+@router.get("/{image_id}")
+def get_image(image_id: str, db: Session = Depends(get_db), user=Depends(AuthDeps.require_user)):
+    img = db.query(UploadedImage).filter(UploadedImage.id == image_id).first()
+    if not img or not os.path.exists(img.storage_path):
+        raise NotFoundError("Image not found.", http_status=404)
+
+    return FileResponse(img.storage_path, media_type=img.mime_type, filename=img.original_filename)
+```
+
+FILE: rheumaassist/backend/scripts/__init__.py
+```python
+# Local scripts package.
+```
+
+FILE: rheumaassist/backend/scripts/seed.py
+```python
+import json
+from datetime import datetime, date, timedelta
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from app.db.session import SessionLocal
+from app.models.role import Role
+from app.models.user import User
+from app.models.patient import Patient
+from app.core.config import settings
+from app.services.password_service import PasswordService
+
+
+def _get_or_create_role(db: Session, name: str) -> Role:
+    r = db.query(Role).filter(Role.name == name).first()
+    if r:
+        return r
+    r = Role(id=str(uuid4()), name=name, created_at=datetime.utcnow())
+    db.add(r)
+    db.commit()
+    db.refresh(r)
+    return r
+
+
+def _ensure_user(db: Session, *, email: str, full_name: str, password: str, roles: list[Role]) -> User:
+    u = db.query(User).filter(User.email == email).first()
+    if u:
+        return u
+
+    ps = PasswordService()
+    now = datetime.utcnow()
+    u = User(
+        id=str(uuid4()),
+        email=email,
+        full_name=full_name,
+        password_hash=ps.hash_password(password),
+        is_active=True,
+        failed_login_attempts=0,
+        locked_until=None,
+        last_login_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    u.roles = roles
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def _ensure_patient(db: Session, *, patient_id: str, hospital_number: str, full_name: str, dob: date, sex: str) -> Patient:
+    p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+    if p:
+        return p
+    now = datetime.utcnow()
+    p = Patient(
+        id=str(uuid4()),
+        patient_id=patient_id,
+        hospital_number=hospital_number,
+        full_name=full_name,
+        date_of_birth=dob,
+        sex=sex,
+        notes="Seeded demo patient. Replace with real patient record.",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+def main() -> None:
+    db = SessionLocal()
+    try:
+        admin_role = _get_or_create_role(db, "Admin")
+        rheum_role = _get_or_create_role(db, "Rheumatologist")
+        resident_role = _get_or_create_role(db, "Resident")
+
+        _ensure_user(
+            db,
+            email="admin@local.demo",
+            full_name="Local Admin",
+            password="AdminPassword!ChangeMe",
+            roles=[admin_role],
+        )
+
+        _ensure_user(
+            db,
+            email="rheum@local.demo",
+            full_name="Demo Rheumatologist",
+            password="RheumPassword!ChangeMe",
+            roles=[rheum_role],
+        )
+
+        _ensure_user(
+            db,
+            email="resident@local.demo",
+            full_name="Demo Resident",
+            password="ResidentPassword!ChangeMe",
+            roles=[resident_role],
+        )
+
+        _ensure_patient(
+            db,
+            patient_id="P-0001",
+            hospital_number="H-10001",
+            full_name="Jane Doe",
+            dob=date(1971, 5, 2),
+            sex="female",
+        )
+
+        _ensure_patient(
+            db,
+            patient_id="P-0002",
+            hospital_number="H-10002",
+            full_name="John Doe",
+            dob=date(1964, 11, 18),
+            sex="male",
+        )
+
+        _ensure_patient(
+            db,
+            patient_id="P-0003",
+            hospital_number="H-10003",
+            full_name="Alex Smith",
+            dob=date(1982, 2, 9),
+            sex="other",
+        )
+
+        print("Seed completed.")
+        print("Demo users:")
+        print("  Admin: admin@local.demo / AdminPassword!ChangeMe")
+        print("  Rheumatologist: rheum@local.demo / RheumPassword!ChangeMe")
+        print("  Resident: resident@local.demo / ResidentPassword!ChangeMe")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+FILE: rheumaassist/backend/tests/__init__.py
+```python
+# Backend tests.
+```
+
+FILE: rheumaassist/backend/tests/conftest.py
+```python
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+# Ensure env vars for tests before importing the app
+TMPDIR = Path(tempfile.gettempdir()) / "rheumaassist_test"
+TMPDIR.mkdir(parents=True, exist_ok=True)
+
+os.environ["DATABASE_URL"] = f"sqlite:///{(TMPDIR / 'test.db').as_posix()}"
+os.environ["UPLOADS_DIR"] = str(TMPDIR / "uploads")
+os.environ["MODEL_ARTIFACTS_DIR"] = str(TMPDIR / "model_artifacts")
+os.environ["SECRET_KEY"] = "test_secret_key"
+os.environ["FRONTEND_ORIGIN"] = "http://localhost:3000"
+
+from app.main import create_app  # noqa: E402
+
+
+@pytest.fixture()
+def client():
+    app = create_app()
+    return TestClient(app)
+```
+
+FILE: rheumaassist/backend/tests/test_auth.py
+```python
+def test_health(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+```
+
+FILE: rheumaassist/backend/app/api/routes/audit.py
+```python
+import json
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from app.db.deps import get_db
+from app.models.audit_log import AuditLog
+from app.schemas.audit import AuditListResponse, AuditItem
+from app.services.admin_service import AuthDeps
+
+router = APIRouter()
+
+
+@router.get("", response_model=AuditListResponse)
+def list_audit_logs(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user=Depends(AuthDeps.require_roles("Admin")),
+) -> AuditListResponse:
+    q = db.query(AuditLog)
+    total = q.count()
+    items = q.order_by(AuditLog.occurred_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
+
+    return AuditListResponse(
+        page=page,
+        page_size=page_size,
+        total=total,
+        items=[
+            AuditItem(
+                id=a.id,
+                event_type=a.event_type,
+                actor_user_id=a.actor_user_id,
+                patient_id=a.patient_id,
+                details=json.loads(a.details_json or "{}"),
+                occurred_at=a.occurred_at,
+            )
+            for a in items
+        ],
+    )
+```
+
+FILE: rheumaassist/backend/app/schemas/audit.py
+```python
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class AuditItem(BaseModel):
+    id: str
+    event_type: str
+    actor_user_id: str | None
+    patient_id: str | None
+    details: dict
+    occurred_at: datetime
+
+
+class AuditListResponse(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    items: list[AuditItem]
+```
+
+FILE: rheumaassist/backend/app/api/routes/admin.py
+```python
+import os
+import json
+from pathlib import Path
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.db.deps import get_db
+from app.models.user import User
+from app.schemas.admin import UserListResponse, UserItem, ModelInfoResponse
+from app.services.admin_service import AuthDeps
+from app.core.config import settings
+
+router = APIRouter()
+
+
+@router.get("/users", response_model=UserListResponse)
+def list_users(db: Session = Depends(get_db), user=Depends(AuthDeps.require_roles("Admin"))):
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    return UserListResponse(
+        items=[
+            UserItem(
+                id=u.id,
+                email=u.email,
+                full_name=u.full_name,
+                is_active=u.is_active,
+                roles=[r.name for r in u.roles],
+                created_at=u.created_at,
+            )
+            for u in users
+        ]
+    )
+
+
+@router.get("/model", response_model=ModelInfoResponse)
+def model_info(user=Depends(AuthDeps.require_roles("Admin"))):
+    base = settings.resolve_path(settings.model_artifacts_dir)
+    cfg = base / settings.model_config_filename
+    ckpt = base / settings.model_checkpoint_filename
+    ts = base / settings.model_scripted_filename
+
+    cfg_data = None
+    if cfg.exists():
+        try:
+            cfg_data = json.loads(cfg.read_text(encoding="utf-8"))
+        except Exception:
+            cfg_data = {"error": "Could not parse config JSON."}
+
+    return ModelInfoResponse(
+        model_artifacts_dir=str(base),
+        config_present=cfg.exists(),
+        checkpoint_present=ckpt.exists(),
+        torchscript_present=ts.exists(),
+        use_torchscript=settings.use_torchscript,
+        config_preview=cfg_data,
+    )
+```
+
+FILE: rheumaassist/backend/app/schemas/admin.py
+```python
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class UserItem(BaseModel):
+    id: str
+    email: str
+    full_name: str
+    is_active: bool
+    roles: list[str]
+    created_at: datetime
+
+
+class UserListResponse(BaseModel):
+    items: list[UserItem]
+
+
+class ModelInfoResponse(BaseModel):
+    model_artifacts_dir: str
+    config_present: bool
+    checkpoint_present: bool
+    torchscript_present: bool
+    use_torchscript: bool
+    config_preview: dict | None
+```
+
+FILE: rheumaassist/backend/app/api/routes/reviews.py
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.core.audit import write_audit_log
+from app.db.deps import get_db
+from app.schemas.review import ReviewCreateRequest, ReviewResponse
+from app.services.review_service import ReviewService
+from app.services.admin_service import AuthDeps
+from app.models.user import User
+
+router = APIRouter()
+
+
+@router.post("/{analysis_id}/draft", response_model=ReviewResponse)
+def save_draft(
+    analysis_id: str,
+    payload: ReviewCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_roles("Admin", "Rheumatologist", "Resident")),
+) -> ReviewResponse:
+    r = ReviewService().save_draft(db, analysis_id=analysis_id, user=user, payload=payload)
+    write_audit_log(db, event_type="review.draft", actor_user_id=user.id, patient_id=r.patient_id, details={"analysis_id": analysis_id})
+    return r
+
+
+@router.post("/{analysis_id}/finalize", response_model=ReviewResponse)
+def finalize(
+    analysis_id: str,
+    payload: ReviewCreateRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_roles("Admin", "Rheumatologist")),
+) -> ReviewResponse:
+    r = ReviewService().finalize(db, analysis_id=analysis_id, user=user, payload=payload)
+    write_audit_log(db, event_type="review.finalize", actor_user_id=user.id, patient_id=r.patient_id, details={"analysis_id": analysis_id})
+    return r
+```
+
+FILE: rheumaassist/backend/app/schemas/review.py
+```python
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+class ReviewCreateRequest(BaseModel):
+    decision: str = Field(pattern="^(CONFIRMED|NOT_CONFIRMED|UNCERTAIN)$")
+    structured_note: dict = Field(default_factory=dict)
+    free_text: str | None = Field(default=None, max_length=5000)
+
+
+class ReviewResponse(BaseModel):
+    id: str
+    analysis_id: str
+    patient_id: str
+    reviewer_user_id: str
+    status: str
+    decision: str | None
+    structured_note: dict
+    free_text: str | None
+    version: int
+    is_current: bool
+    signed_at: datetime | None
+    created_at: datetime
+```
+
+FILE: rheumaassist/backend/app/services/review_service.py
+```python
+import json
+from datetime import datetime
+from uuid import uuid4
+
+from sqlalchemy.orm import Session
+
+from app.core.errors import NotFoundError, ConflictError
+from app.models.ai_analysis import AIAnalysis
+from app.models.clinician_review import ClinicianReview
+from app.models.user import User
+from app.schemas.review import ReviewCreateRequest, ReviewResponse
+
+
+class ReviewService:
+    def _get_analysis(self, db: Session, analysis_id: str) -> AIAnalysis:
+        a = db.query(AIAnalysis).filter(AIAnalysis.id == analysis_id).first()
+        if not a:
+            raise NotFoundError("Analysis not found.", http_status=404)
+        return a
+
+    def _current_review(self, db: Session, analysis_id: str) -> ClinicianReview | None:
+        return (
+            db.query(ClinicianReview)
+            .filter(ClinicianReview.analysis_id == analysis_id, ClinicianReview.is_current == True)  # noqa: E712
+            .first()
+        )
+
+    def save_draft(self, db: Session, *, analysis_id: str, user: User, payload: ReviewCreateRequest) -> ReviewResponse:
+        a = self._get_analysis(db, analysis_id)
+        current = self._current_review(db, analysis_id)
+
+        now = datetime.utcnow()
+        version = 1
+        if current:
+            current.is_current = False
+            db.add(current)
+            db.commit()
+            version = current.version + 1
+
+        r = ClinicianReview(
+            id=str(uuid4()),
+            analysis_id=a.id,
+            patient_id=a.patient_id,
+            reviewer_user_id=user.id,
+            status="DRAFT",
+            decision=payload.decision,
+            structured_note_json=json.dumps(payload.structured_note or {}, ensure_ascii=False),
+            free_text=payload.free_text,
+            version=version,
+            is_current=True,
+            signed_at=None,
+            created_at=now,
+        )
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+
+        return self._to_response(r)
+
+    def finalize(self, db: Session, *, analysis_id: str, user: User, payload: ReviewCreateRequest) -> ReviewResponse:
+        a = self._get_analysis(db, analysis_id)
+
+        now = datetime.utcnow()
+        current = self._current_review(db, analysis_id)
+        version = 1
+        if current:
+            if current.status == "FINAL":
+                raise ConflictError("A final review already exists. Create a new version via draft first.", http_status=409)
+            current.is_current = False
+            db.add(current)
+            db.commit()
+            version = current.version + 1
+
+        r = ClinicianReview(
+            id=str(uuid4()),
+            analysis_id=a.id,
+            patient_id=a.patient_id,
+            reviewer_user_id=user.id,
+            status="FINAL",
+            decision=payload.decision,
+            structured_note_json=json.dumps(payload.structured_note or {}, ensure_ascii=False),
+            free_text=payload.free_text,
+            version=version,
+            is_current=True,
+            signed_at=now,
+            created_at=now,
+        )
+        db.add(r)
+        db.commit()
+        db.refresh(r)
+
+        return self._to_response(r)
+
+    def _to_response(self, r: ClinicianReview) -> ReviewResponse:
+        return ReviewResponse(
+            id=r.id,
+            analysis_id=r.analysis_id,
+            patient_id=r.patient_id,
+            reviewer_user_id=r.reviewer_user_id,
+            status=r.status,
+            decision=r.decision,
+            structured_note=json.loads(r.structured_note_json or "{}"),
+            free_text=r.free_text,
+            version=r.version,
+            is_current=r.is_current,
+            signed_at=r.signed_at,
+            created_at=r.created_at,
+        )
+```
+
+FILE: rheumaassist/backend/app/api/routes/assistant.py
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.db.deps import get_db
+from app.schemas.assistant import AssistantQueryRequest, AssistantQueryResponse
+from app.services.assistant_service import AssistantService
+from app.services.admin_service import AuthDeps
+from app.models.user import User
+
+router = APIRouter()
+
+
+@router.post("/query", response_model=AssistantQueryResponse)
+def query_assistant(
+    payload: AssistantQueryRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(AuthDeps.require_user),
+) -> AssistantQueryResponse:
+    return AssistantService().answer(db, patient_public_id=payload.patient_id, user=user, question=payload.question)
+```
+
+FILE: rheumaassist/backend/app/schemas/assistant.py
+```python
+from pydantic import BaseModel, Field
+
+
+class AssistantQueryRequest(BaseModel):
+    patient_id: str = Field(min_length=2, max_length=50)
+    question: str = Field(min_length=3, max_length=2000)
+
+
+class AssistantCitation(BaseModel):
+    analysis_id: str
+    exam_date: str | None
+
+
+class AssistantQueryResponse(BaseModel):
+    answer: str
+    citations: list[AssistantCitation]
+    used_records_count: int
+```
+
+FILE: rheumaassist/backend/app/services/assistant_service.py
+```python
+import re
+from datetime import date, timedelta
+from sqlalchemy.orm import Session
+
+from app.core.errors import NotFoundError
+from app.models.patient import Patient
+from app.models.ai_analysis import AIAnalysis
+from app.models.exam import Exam
+from app.models.user import User
+from app.schemas.assistant import AssistantQueryResponse, AssistantCitation
+
+
+class AssistantService:
+    """
+    Local-first grounded assistant.
+
+    - No public internet.
+    - Answers only from stored patient data and analyses.
+    - Always returns citations (analysis IDs + exam dates used).
+    """
+
+    def answer(self, db: Session, *, patient_public_id: str, user: User, question: str) -> AssistantQueryResponse:
+        patient = db.query(Patient).filter(Patient.patient_id == patient_public_id).first()
+        if not patient:
+            raise NotFoundError("Patient not found.", http_status=404)
+
+        analyses = (
+            db.query(AIAnalysis)
+            .filter(AIAnalysis.patient_id == patient.id, AIAnalysis.status == "SUCCESS")
+            .order_by(AIAnalysis.created_at.asc())
+            .all()
+        )
+
+        if not analyses:
+            return AssistantQueryResponse(
+                answer="Insufficient data: no successful AI analyses are stored for this patient yet.",
+                citations=[],
+                used_records_count=0,
+            )
+
+        q = question.strip().lower()
+
+        # Helper: attach exam dates
+        def exam_date_for(a: AIAnalysis) -> str | None:
+            e = db.query(Exam).filter(Exam.id == a.exam_id).first()
+            return str(e.exam_date) if e else None
+
+        # Detect "weeks ago" compare request
+        m = re.search(r"(\d+)\s*weeks?\s*ago", q)
+        if "compare" in q and m:
+            weeks = int(m.group(1))
+            latest = analyses[-1]
+            latest_date_str = exam_date_for(latest)
+            latest_date = date.fromisoformat(latest_date_str) if latest_date_str else None
+
+            if not latest_date:
+                return AssistantQueryResponse(
+                    answer="Insufficient data: latest exam date is missing.",
+                    citations=[AssistantCitation(analysis_id=latest.id, exam_date=latest_date_str)],
+                    used_records_count=1,
+                )
+
+            target = latest_date - timedelta(weeks=weeks)
+
+            # Choose closest analysis by exam_date
+            best = None
+            best_delta_days = None
+            for a in analyses:
+                d_str = exam_date_for(a)
+                if not d_str:
+                    continue
+                d = date.fromisoformat(d_str)
+                delta = abs((d - target).days)
+                if best is None or delta < best_delta_days:
+                    best = a
+                    best_delta_days = delta
+
+            if not best:
+                return AssistantQueryResponse(
+                    answer="Insufficient data: could not find a comparable prior exam date.",
+                    citations=[AssistantCitation(analysis_id=latest.id, exam_date=latest_date_str)],
+                    used_records_count=1,
+                )
+
+            delta = (latest.erosion_probability or 0.0) - (best.erosion_probability or 0.0)
+
+            answer = (
+                f"Comparison based on stored analyses only:\n"
+                f"- Latest exam ({latest_date_str}): erosion probability = {latest.erosion_probability:.3f}\n"
+                f"- Reference exam (~{weeks} weeks ago, {exam_date_for(best)}): erosion probability = {best.erosion_probability:.3f}\n"
+                f"- Delta (latest - reference) = {delta:.3f}\n\n"
+                f"Note: This is an assistive score comparison and does not diagnose rheumatoid arthritis."
+            )
+
+            return AssistantQueryResponse(
+                answer=answer,
+                citations=[
+                    AssistantCitation(analysis_id=latest.id, exam_date=latest_date_str),
+                    AssistantCitation(analysis_id=best.id, exam_date=exam_date_for(best)),
+                ],
+                used_records_count=2,
+            )
+
+        if "summarize" in q and ("imaging history" in q or "history" in q):
+            lines = []
+            citations = []
+            for a in analyses:
+                d = exam_date_for(a)
+                lines.append(f"- {d}: probability={a.erosion_probability:.3f}, class={a.predicted_class}")
+                citations.append(AssistantCitation(analysis_id=a.id, exam_date=d))
+            answer = (
+                "Imaging history summary (stored analyses only):\n"
+                + "\n".join(lines)
+                + "\n\nReminder: AI output is assistive and must be reviewed by a licensed clinician."
+            )
+            return AssistantQueryResponse(answer=answer, citations=citations, used_records_count=len(citations))
+
+        if "increased" in q and ("over time" in q or "probability" in q):
+            first = analyses[0]
+            last = analyses[-1]
+            d_first = exam_date_for(first)
+            d_last = exam_date_for(last)
+            delta = (last.erosion_probability or 0.0) - (first.erosion_probability or 0.0)
+
+            trend = "increased" if delta > 0.02 else "decreased" if delta < -0.02 else "remained approximately stable"
+
+            answer = (
+                f"Trend based on stored analyses only:\n"
+                f"- First stored exam ({d_first}): probability={first.erosion_probability:.3f}\n"
+                f"- Latest stored exam ({d_last}): probability={last.erosion_probability:.3f}\n"
+                f"- Net change = {delta:.3f} → probability has {trend}.\n\n"
+                f"Reminder: This is an assistive score trend and does not diagnose rheumatoid arthritis."
+            )
+
+            return AssistantQueryResponse(
+                answer=answer,
+                citations=[
+                    AssistantCitation(analysis_id=first.id, exam_date=d_first),
+                    AssistantCitation(analysis_id=last.id, exam_date=d_last),
+                ],
+                used_records_count=2,
+            )
+
+        if "show" in q and ("analyses" in q or "previous analyses" in q):
+            lines = []
+            citations = []
+            for a in analyses:
+                d = exam_date_for(a)
+                lines.append(f"- {d}: probability={a.erosion_probability:.3f}, class={a.predicted_class}")
+                citations.append(AssistantCitation(analysis_id=a.id, exam_date=d))
+            answer = "Stored AI analyses:\n" + "\n".join(lines)
+            return AssistantQueryResponse(answer=answer, citations=citations, used_records_count=len(citations))
+
+        # Default grounded response
+        return AssistantQueryResponse(
+            answer=(
+                "I can only answer using stored patient records and prior analyses.\n"
+                "Try asking:\n"
+                "- “Summarize this patient’s imaging history.”\n"
+                "- “Compare today’s result with the exam from 12 weeks ago.”\n"
+                "- “Has the erosion probability increased over time?”"
+            ),
+            citations=[],
+            used_records_count=0,
+        )
+```
+
+FILE: rheumaassist/backend/app/tests/test_model_loading.py
+```python
+import json
+from pathlib import Path
+
+import pytest
+
+
+def test_model_loading_missing_artifacts_returns_error(client, monkeypatch, tmp_path):
+    # Force model_artifacts_dir to tmp without files
+    monkeypatch.setenv("MODEL_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("MODEL_CONFIG_FILENAME", "ero_resnet18_config.json")
+    monkeypatch.setenv("MODEL_CHECKPOINT_FILENAME", "ero_resnet18_checkpoint.pth")
+
+    # Import inside test after env patch so settings read updated env
+    from app.ai.model_loader import load_model  # noqa: E402
+    from app.core.errors import AppError  # noqa: E402
+
+    with pytest.raises(AppError):
+        load_model()
+```
+
+---
+
+I will continue in the next message with **all remaining backend files** (remaining schemas, remaining tests, missing `app/api/routes/...` `__init__.py` files, plus any missing imports), and then the **entire frontend** (Next.js pages, components, cropper, comparison chart, admin pages, and tests) — still using the same required `FILE: ...` format until the repository is fully complete.

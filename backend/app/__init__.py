@@ -1,0 +1,1 @@
+# RheumaAssist backend package

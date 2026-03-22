@@ -1,0 +1,25 @@
+{
+    "model_class": "EROBinaryResNet18",
+    "backbone": "resnet18",
+    "dropout": 0.6,
+    "input_size": [
+        224,
+        224
+    ],
+    "num_classes": 1,
+    "threshold": 0.3145112097263336,
+    "train_mean": [
+        0.7281309962272644,
+        0.7281309962272644,
+        0.7281309962272644
+    ],
+    "train_std": [
+        0.1460001915693283,
+        0.1460001915693283,
+        0.1460001915693283
+    ],
+    "class_names": {
+        "0": "No erosion",
+        "1": "Erosion"
+    }
+}
